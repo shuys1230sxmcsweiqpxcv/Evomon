@@ -1,5 +1,13 @@
 loadstring([[function LPH_NO_VIRTUALIZE(f) return f end;]])();
 
+-- NiAuto MM2 Item Notify — POST items matching configured rarities to NiAuto website.
+--
+-- Valid ITEMS_RARITY_TO_NOTIFY values (Sync.Rarities keys, highest tier first):
+--   "Unique", "Ancient", "Godly", "Legendary", "Rare", "Uncommon", "Common",
+--   "Halloween", "Christmas", "Classic"
+-- Note: "Classic" is the in-game "Vintage" tier — use the key "Classic", not "Vintage".
+-- The inventory UI "Classic" tab is a weapon age/category tab, NOT rarity "Classic".
+
 local function readNiAutoConfig()
   local g = getgenv()
   if g and typeof(g.NiAutoConfig) == "table" then return g.NiAutoConfig end
@@ -18,7 +26,8 @@ for k, v in NiAutoConfig do
   end
 end
 
-Config.ITEMS_RARITY_TO_NOTIFY = Config.ITEMS_RARITY_TO_NOTIFY or { "Godly" }
+Config.ITEMS_RARITY_TO_NOTIFY = Config.ITEMS_RARITY_TO_NOTIFY or { "Rare" }
+Config.MinLevel = Config.MinLevel or 10
 Config.NotifyIntervalSeconds = Config.NotifyIntervalSeconds or 60
 Config.NotifyResendSeconds = Config.NotifyResendSeconds or 120
 Config.LogLevel = Config.LogLevel or "INFO"
@@ -53,6 +62,7 @@ local LocalPlayer = Players.LocalPlayer
 local Modules = ReplicatedStorage:WaitForChild("Modules", 30)
 local Sync = require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"))
 local ProfileData = require(Modules:WaitForChild("ProfileData"))
+local LevelModule = require(Modules:WaitForChild("LevelModule"))
 local InventoryModule = require(Modules:WaitForChild("InventoryModule"))
 
 local LOG_RANK = { DEBUG = 1, INFO = 2, WARN = 3, ERROR = 4 }
@@ -243,6 +253,18 @@ local function waitForProfileReady()
   return false
 end
 
+local function getPlayerLevel()
+  if typeof(ProfileData) ~= "table" then
+    return nil
+  end
+  local xp = ProfileData.NewXP
+  if xp == nil then
+    return nil
+  end
+  local level = LevelModule.GetLevel(xp)
+  return typeof(level) == "number" and level or tonumber(level)
+end
+
 local function iterTradeInventoryEntries(onEntry)
   local inv = InventoryModule.GenerateInventoryTables(ProfileData, "Trading")
   if not inv or typeof(inv.Data) ~= "table" then
@@ -373,6 +395,26 @@ local function sendNotifyIfChanged()
     return
   end
 
+  local minLevel = math.max(tonumber(Config.MinLevel) or 10, 1)
+  local playerLevel = getPlayerLevel()
+  if playerLevel == nil then
+    log("WARN", "Player level unknown (ProfileData.NewXP missing) — skip notify")
+    return
+  end
+  if playerLevel < minLevel then
+    log(
+      "WARN",
+      "Player level "
+        .. tostring(playerLevel)
+        .. " < MinLevel "
+        .. tostring(minLevel)
+        .. " — skip notify ("
+        .. tostring(#items)
+        .. " notify-rarity item(s) held)"
+    )
+    return
+  end
+
   local reason = hashChanged and "Inventory changed" or "Periodic resend"
   log("INFO", reason .. " — posting " .. tostring(#items) .. " notify-rarity item(s)")
 
@@ -400,7 +442,15 @@ local function sendNotifyIfChanged()
 end
 
 task.spawn(LPH_NO_VIRTUALIZE(function()
-  log("INFO", "MM2 notify worker started — ApiUrl=" .. API_URL .. " rarities: " .. HttpService:JSONEncode(Config.ITEMS_RARITY_TO_NOTIFY))
+  log(
+    "INFO",
+    "MM2 notify worker started — ApiUrl="
+      .. API_URL
+      .. " MinLevel="
+      .. tostring(Config.MinLevel)
+      .. " rarities: "
+      .. HttpService:JSONEncode(Config.ITEMS_RARITY_TO_NOTIFY)
+  )
   if not waitForCharacterReady() then
     log("WARN", "Character/HRP not ready — continuing anyway")
   end
