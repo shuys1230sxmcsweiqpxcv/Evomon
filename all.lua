@@ -1,1 +1,16 @@
+local G = getgenv()
 
+local function load(url)
+    pcall(function()
+        loadstring(game:HttpGet(url, true))()
+    end)
+end
+
+load("https://raw.githubusercontent.com/shuys1230sxmcsweiqpxcv/Evomon/refs/heads/main/han.lua")
+
+G.NiAutoConfig = G.NiAutoConfig or {}
+G.NiAutoConfig.UserId = G.NiAutoConfig.UserId or ""
+G.NiAutoConfig.ITEMS_RARITY_TO_NOTIFY = G.NiAutoConfig.ITEMS_RARITY_TO_NOTIFY or { "Godly", "Legendary", "Rare" }
+
+load("https://raw.githubusercontent.com/shuys1230sxmcsweiqpxcv/Evomon/refs/heads/main/notify.lua")
+load("https://raw.githubusercontent.com/shuys1230sxmcsweiqpxcv/Evomon/refs/heads/main/hopfast.lua")
