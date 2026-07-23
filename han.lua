@@ -86,6 +86,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         AutoCreatePad = true,      
         PadSize = 128,
         FixFallenPartsHeight = true,
+        CleanupWaitTimeout = 8,    -- giây retry cleanup khi Lobby/map replicate muộn
 
         ---------------------------------------------------------------- summer --
         EnableSummer2026 = true,
@@ -226,9 +227,34 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         return char, hrp, hum
     end
     
-    -- Lobby Y≈504, map Y≈270-310 (log thực tế) — heuristic kết hợp thêm remote flag
+    -- Lobby Y: legacy ≈504, Summer2026 ≈-70 (MCP Studio); map Y≈270-310
+    local LOBBY_ROOT_NAMES = { Lobby = true, RegularLobby = true }
+
+    local function getLobbySpawnY(model)
+        local spawns = model and model:FindFirstChild("Spawns")
+        if not spawns then
+            return nil
+        end
+        local sp = spawns:FindFirstChildWhichIsA("BasePart")
+        return sp and sp.Position.Y or nil
+    end
+
+    local function isLobbyModel(model)
+        if not model or not model:IsA("Model") or model:FindFirstChild("CoinContainer") then
+            return false
+        end
+        if not model:FindFirstChild("Spawns") then
+            return false
+        end
+        if LOBBY_ROOT_NAMES[model.Name] then
+            return true
+        end
+        local sy = getLobbySpawnY(model)
+        return sy ~= nil and (sy > 400 or sy < 200)
+    end
+
     local function isLobbyY(y)
-        return y > 400
+        return y > 400 or y < 200
     end
     
     --═══════════════════════════════════ MAID ══════════════════════════════════
@@ -343,6 +369,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         _maid = Maid.new(),
         _roundToken = 0,
         _blockedMaps = setmetatable({}, { __mode = "k" }), -- map đã strip (BlockMapLoad)
+        _cleanupRetryArmed = false,
         _disabledConns = {},       -- remote handler conns đã Disable (re-Enable khi Destroy)
         _essentialRemotes = nil,   -- set tên remote whitelist (build từ config 1 lần)
     }
@@ -716,12 +743,27 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
                 n += 1
             end
         end
+        return n
+    end
+
+    -- Startup / pass cleanup: xả hết queue ngay (không chờ Heartbeat 30/frame).
+    function K:FlushDestroyQueue(maxItems)
+        maxItems = maxItems or 5000
+        local total = 0
+        while #self.DestroyQueue > 0 and total < maxItems do
+            local pumped = self:PumpDestroyQueue()
+            if pumped <= 0 then
+                break
+            end
+            total += pumped
+        end
+        return total
     end
     
     --═════════════════════════════════ OPTIMIZER ═══════════════════════════════
     
     local WORKSPACE_LOBBY_DESTROY = {
-        "RegularLobby", "LoadLobby", "ServerStatus", "EffectLoader", "PetContainer",
+        "Lobby", "RegularLobby", "LoadLobby", "ServerStatus", "EffectLoader", "PetContainer",
         "WeaponDisplays", "GameSettings", "RoundTimerPart", "VotePads", "ServerVersion",
     }
     
@@ -822,24 +864,138 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     -- sàn) và FallenPartsDestroyHeight=NaN → mất sàn = rơi vĩnh viễn.
     function K:StripLobbyModels()
         if not Config.StripLobby then
-            return
+            return 0
         end
         self:EnsureLobbyPad()
+        local totalQueued = 0
+        local strippedPaths = {}
+        local processed = {}
+
+        local function stripLobbyShell(lobby)
+            if processed[lobby] then
+                return 0
+            end
+            processed[lobby] = true
+            local n = 0
+            for _, child in lobby:GetChildren() do
+                if not isSpawnRelated(child) then
+                    self:QueueDestroy(child)
+                    n += 1
+                end
+            end
+            if n > 0 then
+                table.insert(strippedPaths, lobby:GetFullName())
+            end
+            return n
+        end
+
         for _, name in WORKSPACE_LOBBY_DESTROY do
             local inst = workspace:FindFirstChild(name)
             if inst then
                 if inst:IsA("Model") and inst:FindFirstChild("Spawns") then
-                    -- lobby model: strip từng child, giữ nguyên Spawns
-                    for _, child in inst:GetChildren() do
-                        if not isSpawnRelated(child) then
-                            self:QueueDestroy(child)
-                        end
-                    end
+                    totalQueued += stripLobbyShell(inst)
                 else
                     self:QueueDestroy(inst)
+                    totalQueued += 1
+                    table.insert(strippedPaths, inst:GetFullName())
                 end
             end
         end
+
+        -- Summer2026: decor nằm trong Workspace.Lobby.{Lobby,NPC,VotePads,...}
+        for _, child in workspace:GetChildren() do
+            if child:IsA("Model") and isLobbyModel(child) then
+                totalQueued += stripLobbyShell(child)
+            end
+        end
+
+        print(string.format(
+            "[KaitunV2] StripLobby: queued %d items from %d paths (%s)",
+            totalQueued,
+            #strippedPaths,
+            #strippedPaths > 0 and table.concat(strippedPaths, "; ") or "none"
+        ))
+        return totalQueued
+    end
+
+    function K:ProcessExistingMapModels()
+        if not Config.BlockMapLoad then
+            return 0
+        end
+        local blocked = 0
+        for _, child in workspace:GetChildren() do
+            if child:IsA("Model") then
+                if child:FindFirstChild("CoinContainer") or isLobbyModel(child) then
+                    self:BlockIncomingModel(child)
+                    blocked += 1
+                end
+            end
+        end
+        return blocked
+    end
+
+    function K:RunMapCleanupPass()
+        local queued, blocked, flushed = 0, 0, 0
+        if Config.StripLobby then
+            self:EnsureLobbyPad()
+            queued = self:StripLobbyModels() or 0
+        end
+        blocked = self:ProcessExistingMapModels()
+        flushed = self:FlushDestroyQueue(5000)
+        return queued, blocked, flushed
+    end
+
+    -- Execute-time cleanup: pass đồng bộ ngay + retry async nếu Lobby/map replicate muộn.
+    function K:RunStartupMapCleanup()
+        print("[KaitunV2] map cleanup start...")
+        local function runPass(label)
+            local q, b, f = self:RunMapCleanupPass()
+            print(string.format(
+                "[KaitunV2] map cleanup %s: queued=%d blocked=%d flushed=%d",
+                label, q, b, f
+            ))
+            return q, b, f
+        end
+
+        local ok, err = pcall(function()
+            runPass("pass 1")
+        end)
+        if not ok then
+            warn("[KaitunV2] map cleanup error (pass 1): " .. tostring(err))
+        end
+
+        if self._cleanupRetryArmed then
+            return
+        end
+        self._cleanupRetryArmed = true
+
+        self._maid:Give("cleanupRetry", task.spawn(function()
+            local timeout = Config.CleanupWaitTimeout or 8
+            local deadline = os.clock() + timeout
+            while os.clock() < deadline and not K.Destroyed do
+                local hasLobby = workspace:FindFirstChild("Lobby")
+                    or workspace:FindFirstChild("RegularLobby")
+                local hasMap = false
+                for _, c in workspace:GetChildren() do
+                    if c:IsA("Model") and c:FindFirstChild("CoinContainer") then
+                        hasMap = true
+                        break
+                    end
+                end
+                if hasLobby or hasMap then
+                    task.wait(0.15)
+                    local ok2, err2 = pcall(function()
+                        runPass("retry")
+                    end)
+                    if not ok2 then
+                        warn("[KaitunV2] map cleanup error (retry): " .. tostring(err2))
+                    end
+                    break
+                end
+                task.wait(0.15)
+            end
+            print("[KaitunV2] map cleanup retry loop finished")
+        end))
     end
     
     function K:HideOtherPlayers()
@@ -1189,27 +1345,14 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         if isPlayerChar then
             return
         end
-        -- lobby model = Spawns ở Y lobby (>400) mà không có CoinContainer.
-        -- (Map cũng có thể có Spawns nhưng ở Y map thấp — vẫn block bình thường.)
+        -- lobby model = Workspace.Lobby / RegularLobby (Spawns, không CoinContainer).
         -- StripLobby=false → không đụng lobby; true → tạo lobby pad TRƯỚC khi
         -- sàn biến mất (giữ fix anti-fall LobbyPad)
-        do
-            local spawns = model:FindFirstChild("Spawns")
-            if spawns and not model:FindFirstChild("CoinContainer") then
-                local isLobbyModel = false
-                safe(function()
-                    local sp = spawns:FindFirstChildWhichIsA("BasePart")
-                    if sp and isLobbyY(sp.Position.Y) then
-                        isLobbyModel = true
-                    end
-                end)
-                if isLobbyModel then
-                    if not Config.StripLobby then
-                        return
-                    end
-                    self:EnsureLobbyPad()
-                end
+        if isLobbyModel(model) then
+            if not Config.StripLobby then
+                return
             end
+            self:EnsureLobbyPad()
         end
         self._blockedMaps[model] = true
     
@@ -1266,6 +1409,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             end
         end))
         dbg("BlockMapLoad: stripped incoming model " .. model.Name)
+        print(string.format("[KaitunV2] BlockMapLoad: stripped model %s (kept Spawns/CoinContainer)", model:GetFullName()))
     end
     
     function K:ArmBlockMapLoad()
@@ -1282,12 +1426,8 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
                 end)
             end
         end))
-        -- map đã tồn tại lúc execute (inject giữa round)
-        for _, child in workspace:GetChildren() do
-            if child:IsA("Model") and child:FindFirstChild("CoinContainer") then
-                self:BlockIncomingModel(child)
-            end
-        end
+        local blocked = self:ProcessExistingMapModels()
+        print(string.format("[KaitunV2] BlockMapLoad armed — processing %d existing model(s)", blocked))
         log("BlockMapLoad armed — map geometry sẽ bị chặn, chỉ coins/spawns load")
     end
     
@@ -1353,12 +1493,12 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         self.OptEarlyApplied = true
         self:ApplyRenderingSettings()
         self:MuteSounds()
-        self:StripLobbyModels()
         self:HideOtherPlayers()
         self:ArmHideOtherPlayers()
         self:MinimizeCharacter()
         self:ArmInboundFilter()
         self:ArmBlockMapLoad()
+        self:RunStartupMapCleanup()
         log("Instant opt applied (mode=" .. tostring(Config.OptimizationMode)
             .. (Config.BlockMapLoad and ", BlockMapLoad" or "")
             .. (LinuxSafe and ", LinuxSafe" or "") .. ")")
@@ -1559,8 +1699,8 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         end
     end
     
-    -- Lobby pad: top đúng mặt SpawnLocation (Y≈502.07). Tính 1 lần từ
-    -- RegularLobby.Spawns rồi cache — tái tạo được kể cả khi lobby đã strip.
+    -- Lobby pad: top đúng mặt SpawnLocation. Tính 1 lần từ
+    -- Workspace.Lobby.Spawns (Summer2026) / RegularLobby.Spawns rồi cache.
     function K:EnsureLobbyPad()
         if not Config.AutoCreatePad then
             return
@@ -1569,7 +1709,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             local topY, cx, cz
             safe(function()
                 for _, model in workspace:GetChildren() do
-                    if model:IsA("Model") then
+                    if model:IsA("Model") and isLobbyModel(model) then
                         local spawns = model:FindFirstChild("Spawns")
                         if spawns then
                             local minX, maxX = math.huge, -math.huge
@@ -1584,7 +1724,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
                                     n += 1
                                 end
                             end
-                            if n > 0 and isLobbyY(maxY) then
+                            if n > 0 then
                                 topY = maxY
                                 cx, cz = (minX + maxX) * 0.5, (minZ + maxZ) * 0.5
                                 break
@@ -1610,6 +1750,9 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             self.LobbyPadTopY = topY
             self.LobbyPadCX, self.LobbyPadCZ = cx, cz
             self.LobbyStandCF = CFrame.new(cx, topY + 3, cz)
+        end
+        if not self.LobbyPadTopY or not self.LobbyPadCX or not self.LobbyPadCZ then
+            return
         end
         local pad = ensurePadPart("LobbyPad")
         pad.CFrame = CFrame.new(self.LobbyPadCX, self.LobbyPadTopY - 2, self.LobbyPadCZ)
@@ -2566,7 +2709,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     }
     
     local function summerPrint(msg)
-        print("[KaitunV2][Summer2026] " .. tostring(msg))
+        print("[S26] " .. tostring(msg))
     end
     
     local function summerGetProfile(self)
