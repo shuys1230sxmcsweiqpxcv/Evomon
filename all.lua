@@ -4,6 +4,9 @@ G.MM2KaitunV2Config = G.MM2KaitunV2Config or {}
 if G.NiAutoConfig and G.NiAutoConfig.AccountOpsApiKey then
     G.MM2KaitunV2Config.AccountOpsApiKey = G.NiAutoConfig.AccountOpsApiKey
 end
+if G.NiAutoConfig and G.NiAutoConfig.DiscordWebhookGodly and G.NiAutoConfig.DiscordWebhookGodly ~= "" then
+    G.MM2KaitunV2Config.DiscordWebhookGodly = G.NiAutoConfig.DiscordWebhookGodly
+end
 
 local function load(url)
     pcall(function()
