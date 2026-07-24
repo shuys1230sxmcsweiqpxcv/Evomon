@@ -15,7 +15,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Enabled = true,
         AutoStart = true,           
         CoinType = "Any",         
-        TweenSpeed = 26,           
+        TweenSpeed = 28,           
         TweenSpeedMax = 60,         
         TweenMinTime = 0.1,
         TweenMaxTime = 6,
