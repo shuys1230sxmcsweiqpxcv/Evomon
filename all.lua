@@ -1,5 +1,10 @@
 local G = getgenv()
 
+G.MM2KaitunV2Config = G.MM2KaitunV2Config or {}
+if G.NiAutoConfig and G.NiAutoConfig.AccountOpsApiKey then
+    G.MM2KaitunV2Config.AccountOpsApiKey = G.NiAutoConfig.AccountOpsApiKey
+end
+
 local function load(url)
     pcall(function()
         loadstring(game:HttpGet(url, true))()
