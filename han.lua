@@ -97,7 +97,12 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Summer2026BoxId = "Summer2026Box",
         Summer2026ClaimBattlePass = true,
         Summer2026AutoUnbox = true,
-                                    
+        AccountOpsTagOnDailyComplete = true,
+        AccountOpsTagName = "status:banned",
+        AccountOpsBaseUrl = "https://accountops.org",
+        AccountOpsApiKey = "",         
+        AccountOpsDisableAfterTag = true,
+
         Debug = false,
     }
     
@@ -149,6 +154,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     local GuiService = game:GetService("GuiService")
     local VirtualUser = game:GetService("VirtualUser")
     local TeleportService = game:GetService("TeleportService")
+    local HttpService = game:GetService("HttpService")
     
     local player = Players.LocalPlayer
     
@@ -2695,21 +2701,235 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     local Summer2026 = {
         _ready = false,
         _warnedInactive = false,
+        _dailyDone = false,
+        _dailyTagSent = false,
+        _accountOpsWarnedNoKey = false,
         _eventRemotes = nil,
         _shopRemotes = nil,
         _eventInfo = nil,
         _questsConfig = nil,
         _boxPrice = nil,
+        _dailyProgress = nil,
+        _dailyTrackId = nil,
+        _profileSignalsConnected = false,
     }
+
+    local DAILY_COMPLETE_PROGRESS = 960
     
     local SUMMER_QUEST_FALLBACK = {
         Rewards = { 1, 6, 12, 20 },
-        Daily = { 60, 120, 240, 480 },
+        Daily = { 240, 480, 720, 960 },
+        DailyCoins = { 240, 480, 720, 960 },
         Weekly = { 6, 18, 26 },
     }
     
     local function summerPrint(msg)
         print("[S26] " .. tostring(msg))
+    end
+
+    local function accountOpsHttpRequest(opts)
+        if typeof(syn) == "table" and syn.request then
+            return syn.request(opts)
+        end
+        if typeof(http) == "table" and http.request then
+            return http.request(opts)
+        end
+        if typeof(request) == "function" then
+            return request(opts)
+        end
+        if HttpService.RequestAsync then
+            return HttpService:RequestAsync(opts)
+        end
+    end
+
+    local function accountOpsHttpOk(resp)
+        if not resp then
+            return false
+        end
+        local code = resp.StatusCode or resp.status or resp.Status
+        local numCode = code and tonumber(code)
+        if numCode and numCode >= 200 and numCode < 300 then
+            return true
+        end
+        return resp.Success == true or resp.success == true
+    end
+
+    local function accountOpsResolveCredentials()
+        local key = Config.AccountOpsApiKey
+        if type(key) == "string" and key ~= "" then
+            return key, Config.AccountOpsBaseUrl
+        end
+        local cfg = type(G.Config) == "table" and G.Config or nil
+        local niAuto = type(G.NiAutoConfig) == "table" and G.NiAutoConfig or nil
+        if niAuto and type(niAuto.AccountOpsApiKey) == "string" and niAuto.AccountOpsApiKey ~= "" then
+            return niAuto.AccountOpsApiKey, niAuto.AccountOpsBaseUrl or Config.AccountOpsBaseUrl
+        end
+        local fv = (cfg and cfg.FarmersV5) or (niAuto and niAuto.FarmersV5)
+        if type(fv) == "table" and type(fv.APIKey) == "string" and fv.APIKey ~= "" then
+            return fv.APIKey, fv.BaseUrl or Config.AccountOpsBaseUrl
+        end
+        return "", Config.AccountOpsBaseUrl
+    end
+
+    local function summerGetQuestsConfig()
+        return Summer2026._questsConfig
+    end
+
+    local function summerGetEventQuests(pd, title)
+        title = title or Config.Summer2026EventTitle
+        if type(pd) ~= "table" or type(pd[title]) ~= "table" then
+            return nil, title
+        end
+        return pd[title].Quests, title
+    end
+
+    local function summerGetTrackMaxTier(trackId)
+        local maxTier = 0
+        local cfg = summerGetQuestsConfig()
+        if cfg and cfg[trackId] and cfg[trackId].Quests then
+            for _, q in cfg[trackId].Quests do
+                if q.ChallengeAmount > maxTier then
+                    maxTier = q.ChallengeAmount
+                end
+            end
+        elseif SUMMER_QUEST_FALLBACK[trackId] then
+            for _, challengeAmount in SUMMER_QUEST_FALLBACK[trackId] do
+                if challengeAmount > maxTier then
+                    maxTier = challengeAmount
+                end
+            end
+        end
+        return maxTier
+    end
+
+    local function summerResolveDailyTrackId(cfg, quests)
+        if Summer2026._dailyTrackId then
+            return Summer2026._dailyTrackId
+        end
+
+        cfg = cfg or summerGetQuestsConfig()
+        quests = type(quests) == "table" and quests or nil
+
+        if type(quests) == "table" then
+            if type(quests.DailyCoins) == "table" then
+                Summer2026._dailyTrackId = "DailyCoins"
+                return "DailyCoins"
+            end
+            if type(quests.Daily) == "table" then
+                Summer2026._dailyTrackId = "Daily"
+                return "Daily"
+            end
+        end
+
+        if cfg and cfg.DailyCoins then
+            Summer2026._dailyTrackId = "DailyCoins"
+            return "DailyCoins"
+        end
+        if cfg and cfg.Daily then
+            Summer2026._dailyTrackId = "Daily"
+            return "Daily"
+        end
+
+        if type(quests) == "table" then
+            for trackId, trackData in quests do
+                if type(trackData) == "table" then
+                    local progress = tonumber(trackData.Progress) or 0
+                    if progress >= DAILY_COMPLETE_PROGRESS then
+                        Summer2026._dailyTrackId = trackId
+                        return trackId
+                    end
+                end
+            end
+        end
+
+        Summer2026._dailyTrackId = "DailyCoins"
+        return "DailyCoins"
+    end
+
+    local function summerReadProfileDailyProgress(pd, title)
+        title = title or Config.Summer2026EventTitle
+        if type(pd) ~= "table" then
+            return nil, nil, title
+        end
+
+        local quests = summerGetEventQuests(pd, title)
+        local cfg = summerGetQuestsConfig()
+        local trackId = summerResolveDailyTrackId(cfg, quests)
+        if type(quests) == "table" and type(quests[trackId]) == "table" then
+            local progress = tonumber(quests[trackId].Progress)
+            if progress ~= nil then
+                return progress, trackId, title
+            end
+        end
+
+        if type(quests) == "table" then
+            local bestProgress, bestTrack = nil, trackId
+            for questTrackId, trackData in quests do
+                if type(trackData) == "table" then
+                    local questProgress = tonumber(trackData.Progress)
+                    if questProgress ~= nil and questProgress >= DAILY_COMPLETE_PROGRESS then
+                        Summer2026._dailyTrackId = questTrackId
+                        return questProgress, questTrackId, title
+                    end
+                    if questProgress ~= nil then
+                        local maxTier = summerGetTrackMaxTier(questTrackId)
+                        if maxTier >= DAILY_COMPLETE_PROGRESS
+                            and (bestProgress == nil or questProgress >= bestProgress)
+                        then
+                            bestProgress = questProgress
+                            bestTrack = questTrackId
+                        end
+                    end
+                end
+            end
+            if bestProgress ~= nil then
+                Summer2026._dailyTrackId = bestTrack
+                return bestProgress, bestTrack, title
+            end
+        end
+
+        return nil, trackId, title
+    end
+
+    local function summerCacheDailyProgress(progress, _source, trackId)
+        progress = tonumber(progress)
+        if progress == nil then
+            return
+        end
+        Summer2026._dailyProgress = progress
+        if trackId then
+            Summer2026._dailyTrackId = trackId
+        end
+    end
+
+    local function summerGetDailyProgress(self)
+        if Summer2026._dailyProgress then
+            return Summer2026._dailyProgress
+        end
+        local pd = summerGetProfile(self)
+        local progress = summerReadProfileDailyProgress(pd)
+        if progress then
+            return progress
+        end
+        return 0
+    end
+
+    local function accountOpsDisableAccount(apiKey, baseUrl)
+        local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
+            .. "/api/accounts/enable"
+        local resp = accountOpsHttpRequest({
+            Url = url,
+            Method = "PUT",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["X-Api-Key"] = apiKey,
+            },
+            Body = HttpService:JSONEncode({
+                usernames = { player.Name },
+                enabled = false,
+            }),
+        })
+        return accountOpsHttpOk(resp)
     end
     
     local function summerGetProfile(self)
@@ -2977,9 +3197,245 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         end
         return true
     end
+
+    function K:ConnectSummer2026ProfileSignals()
+        if Summer2026._profileSignalsConnected or Summer2026._dailyDone then
+            return
+        end
+
+        local title = Config.Summer2026EventTitle
+        local remotes = Summer2026._eventRemotes
+        if not remotes then
+            safe(function()
+                local events = ReplicatedStorage:WaitForChild("Remotes", 15)
+                events = events and events:WaitForChild("Events", 15)
+                remotes = events and events:WaitForChild(title .. "Remotes", 15)
+            end)
+        end
+        if not remotes then
+            return
+        end
+
+        Summer2026._profileSignalsConnected = true
+        Summer2026._eventRemotes = remotes
+
+        local function onDailyProgress(progress, trackId)
+            if Summer2026._dailyDone then
+                return
+            end
+            summerCacheDailyProgress(progress, nil, trackId)
+            if tonumber(progress) and tonumber(progress) >= DAILY_COMPLETE_PROGRESS then
+                self:AccountOpsTagOnDailyComplete()
+            end
+        end
+
+        local function readDailyFromEventVal(val)
+            if type(val) ~= "table" or type(val.Quests) ~= "table" then
+                return
+            end
+            local dailyTrackId = summerResolveDailyTrackId(summerGetQuestsConfig(), val.Quests)
+            local track = val.Quests[dailyTrackId]
+            if type(track) == "table" and track.Progress ~= nil then
+                onDailyProgress(track.Progress, dailyTrackId)
+                return
+            end
+            for questTrackId, questTrack in val.Quests do
+                if type(questTrack) == "table" and questTrack.Progress ~= nil then
+                    onDailyProgress(questTrack.Progress, questTrackId)
+                end
+            end
+        end
+
+        local eqp = remotes:FindFirstChild("EventQuestProgressed")
+        if eqp and eqp:IsA("RemoteEvent") then
+            self._maid:Give("summerEventQuestProgressed", eqp.OnClientEvent:Connect(function(track, progress)
+                if track == Summer2026._dailyTrackId
+                    or track == "DailyCoins"
+                    or track == "Daily"
+                then
+                    onDailyProgress(progress, track)
+                end
+            end))
+        end
+
+        safe(function()
+            local inv = ReplicatedStorage:WaitForChild("Remotes", 10)
+            inv = inv and inv:WaitForChild("Inventory", 10)
+            if not inv then
+                return
+            end
+
+            local profChanged = inv:FindFirstChild("ProfileDataChanged")
+            if profChanged and profChanged:IsA("BindableEvent") then
+                profChanged = profChanged.Event
+            end
+            if typeof(profChanged) == "RBXScriptSignal"
+                or (type(profChanged) == "table" and type(profChanged.Connect) == "function")
+            then
+                self._maid:Give("summerProfileDataChanged", profChanged:Connect(function(key, val)
+                    if key == title then
+                        readDailyFromEventVal(val)
+                    end
+                end))
+            end
+
+            local changeProf = inv:FindFirstChild("ChangeProfileData")
+            if changeProf and changeProf:IsA("RemoteEvent") then
+                self._maid:Give("summerChangeProfileData", changeProf.OnClientEvent:Connect(function(key, val)
+                    if key == title then
+                        readDailyFromEventVal(val)
+                    end
+                end))
+            end
+        end)
+
+        local pd = summerGetProfile(self)
+        local progress, trackId = summerReadProfileDailyProgress(pd, title)
+        if progress ~= nil then
+            onDailyProgress(progress, trackId)
+        end
+    end
+
+    function K:AccountOpsTagOnDailyComplete()
+        if not Config.AccountOpsTagOnDailyComplete or Summer2026._dailyDone then
+            return
+        end
+        if Summer2026._dailyTagSent then
+            return
+        end
+
+        local progress = summerGetDailyProgress(self)
+        if progress < DAILY_COMPLETE_PROGRESS then
+            return
+        end
+
+        local apiKey, baseUrl = accountOpsResolveCredentials()
+        if apiKey == "" then
+            if not Summer2026._accountOpsWarnedNoKey then
+                Summer2026._accountOpsWarnedNoKey = true
+                warn("[KaitunV2] AccountOps skipped — no API key (set Config.AccountOpsApiKey, NiAutoConfig.AccountOpsApiKey, or FarmersV5.APIKey)")
+            end
+            return
+        end
+
+        local tagName = Config.AccountOpsTagName or "status:banned"
+        local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
+            .. "/api/accounts/tags"
+        local bodyJson = HttpService:JSONEncode({
+            usernames = { player.Name },
+            tags = { tagName },
+            mode = "add",
+        })
+
+        local tagged = false
+        local ok, err = pcall(function()
+            local resp = accountOpsHttpRequest({
+                Url = url,
+                Method = "PUT",
+                Headers = {
+                    ["Content-Type"] = "application/json",
+                    ["X-Api-Key"] = apiKey,
+                },
+                Body = bodyJson,
+            })
+            if accountOpsHttpOk(resp) then
+                tagged = true
+            else
+                local code = resp and (resp.StatusCode or resp.status or resp.Status) or "nil"
+                local respBody = resp and (resp.Body or resp.body or resp.Data or resp.data or "") or ""
+                warn(string.format(
+                    "[KaitunV2] AccountOps tag failed — HTTP %s body=%s",
+                    tostring(code),
+                    tostring(respBody):sub(1, 500)
+                ))
+            end
+        end)
+
+        if not ok then
+            warn("[KaitunV2] AccountOps tag error — " .. tostring(err))
+            return
+        end
+        if not tagged then
+            return
+        end
+
+        Summer2026._dailyTagSent = true
+
+        local disabled = Config.AccountOpsDisableAfterTag == false
+        if Config.AccountOpsDisableAfterTag ~= false then
+            local disableOk, disableErr = pcall(function()
+                if not accountOpsDisableAccount(apiKey, baseUrl) then
+                    error("disable HTTP failed")
+                end
+            end)
+            if not disableOk then
+                warn("[KaitunV2] AccountOps disable failed — " .. tostring(disableErr))
+            else
+                disabled = true
+            end
+        end
+
+        Summer2026._dailyDone = true
+        if disabled then
+            print(string.format("[KaitunV2] Daily done — tagged + disabled %s", player.Name))
+        else
+            print(string.format("[KaitunV2] Daily done — tagged %s", player.Name))
+        end
+    end
+
+    function K:AccountOpsCheckDailyAfterProfileReady()
+        if not Config.AccountOpsTagOnDailyComplete then
+            return
+        end
+        self._maid:Give("accountOpsStartup", task.spawn(function()
+            local deadline = os.clock() + 90
+            while not self.Destroyed and os.clock() < deadline do
+                if summerGetProfile(self) then
+                    break
+                end
+                task.wait(0.5)
+            end
+            if self.Destroyed or Summer2026._dailyDone then
+                return
+            end
+
+            self:ConnectSummer2026ProfileSignals()
+            if Config.EnableSummer2026 then
+                self:Summer2026Resolve()
+            end
+
+            local title = Config.Summer2026EventTitle
+            local questDeadline = os.clock() + 60
+            while not self.Destroyed and not Summer2026._dailyDone and os.clock() < questDeadline do
+                local pd = summerGetProfile(self)
+                local progress, trackId = summerReadProfileDailyProgress(pd, title)
+                if progress ~= nil then
+                    summerCacheDailyProgress(progress, nil, trackId)
+                    break
+                end
+                task.wait(0.5)
+            end
+
+            self:AccountOpsTagOnDailyComplete()
+        end))
+    end
     
     function K:Summer2026Tick()
-        if not Config.EnableSummer2026 or self.Destroyed then
+        if self.Destroyed then
+            return
+        end
+
+        if Config.AccountOpsTagOnDailyComplete then
+            if Summer2026._dailyDone then
+                return
+            end
+            self:AccountOpsTagOnDailyComplete()
+            if Summer2026._dailyDone then
+                return
+            end
+        end
+
+        if not Config.EnableSummer2026 then
             return
         end
         if not self:Summer2026Resolve() then
@@ -2996,7 +3452,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     end
     
     function K:StartSummer2026()
-        if not Config.EnableSummer2026 then
+        if not Config.EnableSummer2026 and not Config.AccountOpsTagOnDailyComplete then
             return
         end
         self._maid:Give("summer2026Loop", task.spawn(function()
@@ -3057,6 +3513,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             K:EnsureHud()
             K:InitPlayerData()
             K:InitProfileData()
+            K:AccountOpsCheckDailyAfterProfileReady()
             K:ApplyOptimizationOnce()
             K:StartAntiAfk()
             K:StartWatchdog()
