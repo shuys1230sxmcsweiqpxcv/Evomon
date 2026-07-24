@@ -15,7 +15,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Enabled = true,
         AutoStart = true,           
         CoinType = "Any",         
-        TweenSpeed = 28,           
+        TweenSpeed = 26,           
         TweenSpeedMax = 60,         
         TweenMinTime = 0.1,
         TweenMaxTime = 6,
@@ -104,6 +104,9 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         AccountOpsApiKey = "",         
         AccountOpsDisableAfterTag = true,
         AccountOpsTagDelaySeconds = 60,    -- giây chờ sau khi shells < ngưỡng trước tag+disable
+        AccountOpsAutoswapOnDailyComplete = true,
+        AccountOpsAutoswapOption = 2,      -- rule number on AccountOps UI (On Demand rule)
+        AccountOpsAutoswapInsteadOfTag = true,
         DiscordWebhookGodly = "",        -- Discord webhook URL for godly box drops
         DiscordWebhookGodlyEnabled = true,
 
@@ -2707,6 +2710,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         _warnedInactive = false,
         _dailyDone = false,
         _dailyTagSent = false,
+        _dailyAutoswapSent = false,
         _accountOpsWarnedNoKey = false,
         _accountOpsWaitingShellsLogged = false,
         _shellsBelowThresholdAt = nil,
@@ -3076,6 +3080,24 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         })
         return accountOpsHttpOk(resp)
     end
+
+    local function accountOpsAutoswapComplete(apiKey, baseUrl, option)
+        local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
+            .. "/api/accounts/autoswap-complete"
+        local resp = accountOpsHttpRequest({
+            Url = url,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["X-Api-Key"] = apiKey,
+            },
+            Body = HttpService:JSONEncode({
+                username = player.Name,
+                option = option,
+            }),
+        })
+        return accountOpsHttpOk(resp), resp
+    end
     
     local function summerGetProfile(self)
         local pd = self.ProfileData or self:TryRequireProfileData()
@@ -3089,7 +3111,9 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         if Summer2026._ready then
             return true
         end
-        if not Config.EnableSummer2026 and not Config.AccountOpsTagOnDailyComplete then
+        if not Config.EnableSummer2026
+            and not Config.AccountOpsTagOnDailyComplete
+            and not Config.AccountOpsAutoswapOnDailyComplete then
             return false
         end
     
@@ -3454,53 +3478,72 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     end
 
     function K:AccountOpsTagOnDailyComplete()
-        if not Config.AccountOpsTagOnDailyComplete or Summer2026._dailyDone then
+        local wantTag = Config.AccountOpsTagOnDailyComplete == true
+            and Config.AccountOpsAutoswapInsteadOfTag ~= true
+        local wantAutoswap = Config.AccountOpsAutoswapOnDailyComplete == true
+        if not wantTag and not wantAutoswap then
             return
         end
-        if Summer2026._dailyTagSent then
+        if Summer2026._dailyDone then
+            return
+        end
+        if not wantTag and wantAutoswap and Summer2026._dailyAutoswapSent then
+            return
+        end
+        if wantTag and not wantAutoswap and Summer2026._dailyTagSent then
+            return
+        end
+        if wantTag and wantAutoswap and Summer2026._dailyTagSent and Summer2026._dailyAutoswapSent then
             return
         end
 
-        local progress = summerGetDailyProgress(self)
-        if progress < DAILY_COMPLETE_PROGRESS then
-            return
-        end
+        local retryAutoswapOnly = wantAutoswap and wantTag
+            and Summer2026._dailyTagSent
+            and not Summer2026._dailyAutoswapSent
 
-        self:Summer2026Resolve()
-        local threshold = self:AccountOpsGetShellTagThreshold()
-        local shells = self:Summer2026GetShells()
-        if shells >= threshold then
-            Summer2026._shellsBelowThresholdAt = nil
-            Summer2026._accountOpsTagDelayLogged = nil
-            if not Summer2026._accountOpsWaitingShellsLogged then
-                Summer2026._accountOpsWaitingShellsLogged = true
-                summerPrint(string.format(
-                    "Daily done — waiting to spend shells before tag (%d>=%d)",
-                    shells,
-                    threshold
-                ))
+        if not retryAutoswapOnly then
+            local progress = summerGetDailyProgress(self)
+            if progress < DAILY_COMPLETE_PROGRESS then
+                return
             end
-            return
-        end
 
-        Summer2026._accountOpsWaitingShellsLogged = false
-        if not Summer2026._shellsBelowThresholdAt then
-            Summer2026._shellsBelowThresholdAt = os.clock()
-            Summer2026._accountOpsTagDelayLogged = nil
-        end
-
-        local delaySec = tonumber(Config.AccountOpsTagDelaySeconds) or 60
-        if delaySec < 0 then
-            delaySec = 0
-        end
-        local elapsed = os.clock() - Summer2026._shellsBelowThresholdAt
-        if elapsed < delaySec then
-            local remaining = math.ceil(delaySec - elapsed)
-            if Summer2026._accountOpsTagDelayLogged ~= remaining then
-                Summer2026._accountOpsTagDelayLogged = remaining
-                summerPrint(string.format("Daily done — tag+disable in %ds", remaining))
+            self:Summer2026Resolve()
+            local threshold = self:AccountOpsGetShellTagThreshold()
+            local shells = self:Summer2026GetShells()
+            if shells >= threshold then
+                Summer2026._shellsBelowThresholdAt = nil
+                Summer2026._accountOpsTagDelayLogged = nil
+                if not Summer2026._accountOpsWaitingShellsLogged then
+                    Summer2026._accountOpsWaitingShellsLogged = true
+                    summerPrint(string.format(
+                        "Daily done — waiting to spend shells before tag (%d>=%d)",
+                        shells,
+                        threshold
+                    ))
+                end
+                return
             end
-            return
+
+            Summer2026._accountOpsWaitingShellsLogged = false
+            if not Summer2026._shellsBelowThresholdAt then
+                Summer2026._shellsBelowThresholdAt = os.clock()
+                Summer2026._accountOpsTagDelayLogged = nil
+            end
+
+            local delaySec = tonumber(Config.AccountOpsTagDelaySeconds) or 60
+            if delaySec < 0 then
+                delaySec = 0
+            end
+            local elapsed = os.clock() - Summer2026._shellsBelowThresholdAt
+            if elapsed < delaySec then
+                local remaining = math.ceil(delaySec - elapsed)
+                if Summer2026._accountOpsTagDelayLogged ~= remaining then
+                    Summer2026._accountOpsTagDelayLogged = remaining
+                    local actionLabel = wantAutoswap and not wantTag and "autoswap" or "tag+disable"
+                    summerPrint(string.format("Daily done — %s in %ds", actionLabel, remaining))
+                end
+                return
+            end
         end
 
         local apiKey, baseUrl = accountOpsResolveCredentials()
@@ -3512,61 +3555,119 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             return
         end
 
-        local tagName = Config.AccountOpsTagName or "status:banned"
-        local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
-            .. "/api/accounts/tags"
-        local bodyJson = HttpService:JSONEncode({
-            usernames = { player.Name },
-            tags = { tagName },
-            mode = "add",
-        })
-
-        local tagged = false
-        local ok, err = pcall(function()
-            local resp = accountOpsHttpRequest({
-                Url = url,
-                Method = "PUT",
-                Headers = {
-                    ["Content-Type"] = "application/json",
-                    ["X-Api-Key"] = apiKey,
-                },
-                Body = bodyJson,
+        local tagged = not wantTag
+        local disabled = not wantTag
+        if wantTag and not Summer2026._dailyTagSent then
+            local tagName = Config.AccountOpsTagName or "status:banned"
+            local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
+                .. "/api/accounts/tags"
+            local bodyJson = HttpService:JSONEncode({
+                usernames = { player.Name },
+                tags = { tagName },
+                mode = "add",
             })
-            if accountOpsHttpOk(resp) then
-                tagged = true
-            else
-                local code = resp and (resp.StatusCode or resp.status or resp.Status) or "nil"
-                local respBody = resp and (resp.Body or resp.body or resp.Data or resp.data or "") or ""
-                warn(string.format(
-                    "[KaitunV2] AccountOps tag failed — HTTP %s body=%s",
-                    tostring(code),
-                    tostring(respBody):sub(1, 500)
-                ))
-            end
-        end)
 
-        if not ok then
-            warn("[KaitunV2] AccountOps tag error — " .. tostring(err))
-            return
-        end
-        if not tagged then
-            return
-        end
-
-        Summer2026._dailyTagSent = true
-
-        local disabled = Config.AccountOpsDisableAfterTag == false
-        if Config.AccountOpsDisableAfterTag ~= false then
-            local disableOk, disableErr = pcall(function()
-                if not accountOpsDisableAccount(apiKey, baseUrl) then
-                    error("disable HTTP failed")
+            tagged = false
+            local ok, err = pcall(function()
+                local resp = accountOpsHttpRequest({
+                    Url = url,
+                    Method = "PUT",
+                    Headers = {
+                        ["Content-Type"] = "application/json",
+                        ["X-Api-Key"] = apiKey,
+                    },
+                    Body = bodyJson,
+                })
+                if accountOpsHttpOk(resp) then
+                    tagged = true
+                else
+                    local code = resp and (resp.StatusCode or resp.status or resp.Status) or "nil"
+                    local respBody = resp and (resp.Body or resp.body or resp.Data or resp.data or "") or ""
+                    warn(string.format(
+                        "[KaitunV2] AccountOps tag failed — HTTP %s body=%s",
+                        tostring(code),
+                        tostring(respBody):sub(1, 500)
+                    ))
                 end
             end)
-            if not disableOk then
-                warn("[KaitunV2] AccountOps disable failed — " .. tostring(disableErr))
-            else
-                disabled = true
+
+            if not ok then
+                warn("[KaitunV2] AccountOps tag error — " .. tostring(err))
+                return
             end
+            if not tagged then
+                return
+            end
+
+            Summer2026._dailyTagSent = true
+
+            disabled = Config.AccountOpsDisableAfterTag == false
+            if Config.AccountOpsDisableAfterTag ~= false then
+                local disableOk, disableErr = pcall(function()
+                    if not accountOpsDisableAccount(apiKey, baseUrl) then
+                        error("disable HTTP failed")
+                    end
+                end)
+                if not disableOk then
+                    warn("[KaitunV2] AccountOps disable failed — " .. tostring(disableErr))
+                else
+                    disabled = true
+                end
+            end
+        elseif wantTag then
+            tagged = true
+            disabled = true
+        end
+
+        if wantAutoswap then
+            local option = tonumber(Config.AccountOpsAutoswapOption) or 2
+            local swapped = false
+            local ok, err = pcall(function()
+                local success, resp = accountOpsAutoswapComplete(apiKey, baseUrl, option)
+                if success then
+                    swapped = true
+                else
+                    local code = resp and (resp.StatusCode or resp.status or resp.Status) or "nil"
+                    local respBody = resp and (resp.Body or resp.body or resp.Data or resp.data or "") or ""
+                    warn(string.format(
+                        "[KaitunV2] AccountOps autoswap failed — HTTP %s body=%s",
+                        tostring(code),
+                        tostring(respBody):sub(1, 500)
+                    ))
+                end
+            end)
+            if not ok then
+                warn("[KaitunV2] AccountOps autoswap error — " .. tostring(err))
+                return
+            end
+            if not swapped then
+                return
+            end
+
+            Summer2026._dailyAutoswapSent = true
+            Summer2026._dailyDone = true
+            if wantTag then
+                if disabled then
+                    print(string.format(
+                        "[KaitunV2] Daily done — tagged + disabled + autoswap %s (option %d)",
+                        player.Name,
+                        option
+                    ))
+                else
+                    print(string.format(
+                        "[KaitunV2] Daily done — tagged + autoswap %s (option %d)",
+                        player.Name,
+                        option
+                    ))
+                end
+            else
+                print(string.format(
+                    "[KaitunV2] Daily done — autoswap %s (option %d)",
+                    player.Name,
+                    option
+                ))
+            end
+            return
         end
 
         Summer2026._dailyDone = true
@@ -3578,7 +3679,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     end
 
     function K:AccountOpsCheckDailyAfterProfileReady()
-        if not Config.AccountOpsTagOnDailyComplete then
+        if not Config.AccountOpsTagOnDailyComplete and not Config.AccountOpsAutoswapOnDailyComplete then
             return
         end
         self._maid:Give("accountOpsStartup", task.spawn(function()
@@ -3594,7 +3695,9 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             end
 
             self:ConnectSummer2026ProfileSignals()
-            if Config.EnableSummer2026 or Config.AccountOpsTagOnDailyComplete then
+            if Config.EnableSummer2026
+                or Config.AccountOpsTagOnDailyComplete
+                or Config.AccountOpsAutoswapOnDailyComplete then
                 self:Summer2026Resolve()
             end
 
@@ -3621,6 +3724,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
 
         local needSummer = Config.EnableSummer2026
         local needAccountOps = Config.AccountOpsTagOnDailyComplete
+            or Config.AccountOpsAutoswapOnDailyComplete
         if not needSummer and not needAccountOps then
             return
         end
@@ -3648,7 +3752,9 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     end
     
     function K:StartSummer2026()
-        if not Config.EnableSummer2026 and not Config.AccountOpsTagOnDailyComplete then
+        if not Config.EnableSummer2026
+            and not Config.AccountOpsTagOnDailyComplete
+            and not Config.AccountOpsAutoswapOnDailyComplete then
             return
         end
         self._maid:Give("summer2026Loop", task.spawn(function()
