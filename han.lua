@@ -15,7 +15,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Enabled = true,
         AutoStart = true,           
         CoinType = "Any",         
-        TweenSpeed = 26,           
+        TweenSpeed = 28,           
         TweenSpeedMax = 60,         
         TweenMinTime = 0.1,
         TweenMaxTime = 6,
@@ -97,16 +97,14 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Summer2026BoxId = "Summer2026Box",
         Summer2026ClaimBattlePass = true,
         Summer2026AutoUnbox = true,
-        AccountOpsTagOnDailyComplete = true,
-        AccountOpsMinShellsBeforeTag = 0,  -- 0 = auto từ giá box (NewShop / MinShellsForBox)
-        AccountOpsTagName = "status:banned",
+        AccountOpsAutoswapMaxShells = 120, -- chỉ autoswap khi shells < ngưỡng này
         AccountOpsBaseUrl = "https://accountops.org",
         AccountOpsApiKey = "",         
-        AccountOpsDisableAfterTag = true,
-        AccountOpsTagDelaySeconds = 60,    -- giây chờ sau khi shells < ngưỡng trước tag+disable
+        AccountOpsAutoswapDelaySeconds = 60,   -- giây chờ sau khi đủ điều kiện trước lần gửi đầu
         AccountOpsAutoswapOnDailyComplete = true,
-        AccountOpsAutoswapOption = 2,      -- rule number on AccountOps UI (On Demand rule)
-        AccountOpsAutoswapInsteadOfTag = true,
+        AccountOpsAutoswapOption = 2,      -- rule number on AccountOps UI (no-godly / default)
+        AccountOpsAutoswapGodlyOption = 3, -- rule number when account holds a Godly item (priority)
+        AccountOpsAutoswapIntervalSeconds = 60, -- gửi lại mỗi N giây khi vẫn đủ điều kiện
         DiscordWebhookGodly = "",        -- Discord webhook URL for godly box drops
         DiscordWebhookGodlyEnabled = true,
 
@@ -2709,12 +2707,9 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         _ready = false,
         _warnedInactive = false,
         _dailyDone = false,
-        _dailyTagSent = false,
-        _dailyAutoswapSent = false,
+        _autoswapLoopActive = false,
+        _hasGodly = false,
         _accountOpsWarnedNoKey = false,
-        _accountOpsWaitingShellsLogged = false,
-        _shellsBelowThresholdAt = nil,
-        _accountOpsTagDelayLogged = nil,
         _eventRemotes = nil,
         _shopRemotes = nil,
         _eventInfo = nil,
@@ -2860,6 +2855,29 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
 
     local function summerIsGodlyRarity(rarity)
         return type(rarity) == "string" and string.lower(rarity) == "godly"
+    end
+
+    -- Best-effort scan of the account's owned inventory for any Godly-rarity
+    -- item. ProfileData.Inventory is keyed by category (Knives/Guns/Pets/...) →
+    -- { itemId = ownedCount }. Rarity is resolved via the Sync buckets, same as
+    -- unbox rewards. Returns true on the first Godly found.
+    local function summerProfileHasGodlyItem(pd)
+        if type(pd) ~= "table" or type(pd.Inventory) ~= "table" then
+            return false
+        end
+        for _, bucket in pd.Inventory do
+            if type(bucket) == "table" then
+                for itemId, owned in bucket do
+                    if owned and type(itemId) == "string" and itemId ~= "" then
+                        local item = summerResolveRewardItem(itemId)
+                        if item and summerIsGodlyRarity(item.rarity) then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+        return false
     end
 
     local function summerSendGodlyWebhook(rewardItem, boxId)
@@ -3063,24 +3081,6 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         return 0
     end
 
-    local function accountOpsDisableAccount(apiKey, baseUrl)
-        local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
-            .. "/api/accounts/enable"
-        local resp = accountOpsHttpRequest({
-            Url = url,
-            Method = "PUT",
-            Headers = {
-                ["Content-Type"] = "application/json",
-                ["X-Api-Key"] = apiKey,
-            },
-            Body = HttpService:JSONEncode({
-                usernames = { player.Name },
-                enabled = false,
-            }),
-        })
-        return accountOpsHttpOk(resp)
-    end
-
     local function accountOpsAutoswapComplete(apiKey, baseUrl, option)
         local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
             .. "/api/accounts/autoswap-complete"
@@ -3112,7 +3112,6 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             return true
         end
         if not Config.EnableSummer2026
-            and not Config.AccountOpsTagOnDailyComplete
             and not Config.AccountOpsAutoswapOnDailyComplete then
             return false
         end
@@ -3185,11 +3184,8 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         return Summer2026._boxPrice or 1
     end
 
-    function K:AccountOpsGetShellTagThreshold()
-        if Config.AccountOpsMinShellsBeforeTag and Config.AccountOpsMinShellsBeforeTag > 0 then
-            return Config.AccountOpsMinShellsBeforeTag
-        end
-        return self:Summer2026GetBoxPrice()
+    function K:AccountOpsGetShellSwapThreshold()
+        return tonumber(Config.AccountOpsAutoswapMaxShells) or 120
     end
     
     function K:Summer2026GetQuestTiers(trackId)
@@ -3374,6 +3370,12 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
 
         local rewardItem = summerResolveRewardItem(rewardId)
         if rewardItem and summerIsGodlyRarity(rewardItem.rarity) then
+            Summer2026._hasGodly = true
+            summerPrint(string.format(
+                "Godly unboxed (%s) — autoswap will use option %d",
+                tostring(rewardItem.name or rewardItem.id),
+                tonumber(Config.AccountOpsAutoswapGodlyOption) or 3
+            ))
             summerSendGodlyWebhook(rewardItem, Config.Summer2026BoxId)
         end
         return true
@@ -3477,73 +3479,52 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         end
     end
 
+    -- True only when the account has claimed all daily quests AND holds fewer
+    -- than AccountOpsAutoswapMaxShells shells. This is the sole autoswap gate.
+    function K:AccountOpsAutoswapConditionsMet()
+        self:Summer2026Resolve()
+        if summerGetDailyProgress(self) < DAILY_COMPLETE_PROGRESS then
+            return false
+        end
+        local maxShells = self:AccountOpsGetShellSwapThreshold()
+        return self:Summer2026GetShells() < maxShells
+    end
+
+    -- True if the account owns (or just unboxed) a Godly-rarity item. The
+    -- openbox flow latches Summer2026._hasGodly; if the latch is unset we still
+    -- scan the current profile inventory so a pre-owned Godly is picked up.
+    function K:AccountOpsHasGodlyItem()
+        if Summer2026._hasGodly then
+            return true
+        end
+        if summerProfileHasGodlyItem(summerGetProfile(self)) then
+            Summer2026._hasGodly = true
+            return true
+        end
+        return false
+    end
+
+    -- Godly present → godly option (priority, skips the default option);
+    -- otherwise the default option. Returns option, hasGodly.
+    function K:AccountOpsResolveSwapOption()
+        local baseOption = tonumber(Config.AccountOpsAutoswapOption) or 2
+        local godlyOption = tonumber(Config.AccountOpsAutoswapGodlyOption) or 3
+        if self:AccountOpsHasGodlyItem() then
+            return godlyOption, true
+        end
+        return baseOption, false
+    end
+
     function K:AccountOpsTagOnDailyComplete()
-        local wantTag = Config.AccountOpsTagOnDailyComplete == true
-            and Config.AccountOpsAutoswapInsteadOfTag ~= true
-        local wantAutoswap = Config.AccountOpsAutoswapOnDailyComplete == true
-        if not wantTag and not wantAutoswap then
+        if Config.AccountOpsAutoswapOnDailyComplete ~= true then
             return
         end
-        if Summer2026._dailyDone then
+        -- A single loop owns the repeated sends; don't start a second one.
+        if Summer2026._autoswapLoopActive then
             return
         end
-        if not wantTag and wantAutoswap and Summer2026._dailyAutoswapSent then
+        if not self:AccountOpsAutoswapConditionsMet() then
             return
-        end
-        if wantTag and not wantAutoswap and Summer2026._dailyTagSent then
-            return
-        end
-        if wantTag and wantAutoswap and Summer2026._dailyTagSent and Summer2026._dailyAutoswapSent then
-            return
-        end
-
-        local retryAutoswapOnly = wantAutoswap and wantTag
-            and Summer2026._dailyTagSent
-            and not Summer2026._dailyAutoswapSent
-
-        if not retryAutoswapOnly then
-            local progress = summerGetDailyProgress(self)
-            if progress < DAILY_COMPLETE_PROGRESS then
-                return
-            end
-
-            self:Summer2026Resolve()
-            local threshold = self:AccountOpsGetShellTagThreshold()
-            local shells = self:Summer2026GetShells()
-            if shells >= threshold then
-                Summer2026._shellsBelowThresholdAt = nil
-                Summer2026._accountOpsTagDelayLogged = nil
-                if not Summer2026._accountOpsWaitingShellsLogged then
-                    Summer2026._accountOpsWaitingShellsLogged = true
-                    summerPrint(string.format(
-                        "Daily done — waiting to spend shells before tag (%d>=%d)",
-                        shells,
-                        threshold
-                    ))
-                end
-                return
-            end
-
-            Summer2026._accountOpsWaitingShellsLogged = false
-            if not Summer2026._shellsBelowThresholdAt then
-                Summer2026._shellsBelowThresholdAt = os.clock()
-                Summer2026._accountOpsTagDelayLogged = nil
-            end
-
-            local delaySec = tonumber(Config.AccountOpsTagDelaySeconds) or 60
-            if delaySec < 0 then
-                delaySec = 0
-            end
-            local elapsed = os.clock() - Summer2026._shellsBelowThresholdAt
-            if elapsed < delaySec then
-                local remaining = math.ceil(delaySec - elapsed)
-                if Summer2026._accountOpsTagDelayLogged ~= remaining then
-                    Summer2026._accountOpsTagDelayLogged = remaining
-                    local actionLabel = wantAutoswap and not wantTag and "autoswap" or "tag+disable"
-                    summerPrint(string.format("Daily done — %s in %ds", actionLabel, remaining))
-                end
-                return
-            end
         end
 
         local apiKey, baseUrl = accountOpsResolveCredentials()
@@ -3555,131 +3536,96 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             return
         end
 
-        local tagged = not wantTag
-        local disabled = not wantTag
-        if wantTag and not Summer2026._dailyTagSent then
-            local tagName = Config.AccountOpsTagName or "status:banned"
-            local url = tostring(baseUrl or Config.AccountOpsBaseUrl or "https://accountops.org"):gsub("/$", "")
-                .. "/api/accounts/tags"
-            local bodyJson = HttpService:JSONEncode({
-                usernames = { player.Name },
-                tags = { tagName },
-                mode = "add",
-            })
+        -- Loop re-resolves the option each tick; seed with the current choice.
+        local option = self:AccountOpsResolveSwapOption()
+        self:AccountOpsStartAutoswapLoop({ apiKey = apiKey, baseUrl = baseUrl, option = option })
+    end
 
-            tagged = false
-            local ok, err = pcall(function()
-                local resp = accountOpsHttpRequest({
-                    Url = url,
-                    Method = "PUT",
-                    Headers = {
-                        ["Content-Type"] = "application/json",
-                        ["X-Api-Key"] = apiKey,
-                    },
-                    Body = bodyJson,
-                })
-                if accountOpsHttpOk(resp) then
-                    tagged = true
-                else
-                    local code = resp and (resp.StatusCode or resp.status or resp.Status) or "nil"
-                    local respBody = resp and (resp.Body or resp.body or resp.Data or resp.data or "") or ""
-                    warn(string.format(
-                        "[KaitunV2] AccountOps tag failed — HTTP %s body=%s",
-                        tostring(code),
-                        tostring(respBody):sub(1, 500)
-                    ))
-                end
-            end)
-
-            if not ok then
-                warn("[KaitunV2] AccountOps tag error — " .. tostring(err))
-                return
-            end
-            if not tagged then
-                return
-            end
-
-            Summer2026._dailyTagSent = true
-
-            disabled = Config.AccountOpsDisableAfterTag == false
-            if Config.AccountOpsDisableAfterTag ~= false then
-                local disableOk, disableErr = pcall(function()
-                    if not accountOpsDisableAccount(apiKey, baseUrl) then
-                        error("disable HTTP failed")
-                    end
-                end)
-                if not disableOk then
-                    warn("[KaitunV2] AccountOps disable failed — " .. tostring(disableErr))
-                else
-                    disabled = true
-                end
-            end
-        elseif wantTag then
-            tagged = true
-            disabled = true
-        end
-
-        if wantAutoswap then
-            local option = tonumber(Config.AccountOpsAutoswapOption) or 2
-            local swapped = false
-            local ok, err = pcall(function()
-                local success, resp = accountOpsAutoswapComplete(apiKey, baseUrl, option)
-                if success then
-                    swapped = true
-                else
-                    local code = resp and (resp.StatusCode or resp.status or resp.Status) or "nil"
-                    local respBody = resp and (resp.Body or resp.body or resp.Data or resp.data or "") or ""
-                    warn(string.format(
-                        "[KaitunV2] AccountOps autoswap failed — HTTP %s body=%s",
-                        tostring(code),
-                        tostring(respBody):sub(1, 500)
-                    ))
-                end
-            end)
-            if not ok then
-                warn("[KaitunV2] AccountOps autoswap error — " .. tostring(err))
-                return
-            end
-            if not swapped then
-                return
-            end
-
-            Summer2026._dailyAutoswapSent = true
-            Summer2026._dailyDone = true
-            if wantTag then
-                if disabled then
-                    print(string.format(
-                        "[KaitunV2] Daily done — tagged + disabled + autoswap %s (option %d)",
-                        player.Name,
-                        option
-                    ))
-                else
-                    print(string.format(
-                        "[KaitunV2] Daily done — tagged + autoswap %s (option %d)",
-                        player.Name,
-                        option
-                    ))
-                end
-            else
-                print(string.format(
-                    "[KaitunV2] Daily done — autoswap %s (option %d)",
-                    player.Name,
-                    option
-                ))
-            end
+    -- Waits the delay once conditions are met, then re-sends every interval
+    -- seconds while they still hold. Re-checks daily+shells at the top of each
+    -- iteration and stops (re-armable) when they no longer hold. A send failure
+    -- does not stop the loop, so the next tick still goes out.
+    function K:AccountOpsStartAutoswapLoop(ctx)
+        if Summer2026._autoswapLoopActive then
             return
         end
+        Summer2026._autoswapLoopActive = true
 
-        Summer2026._dailyDone = true
-        if disabled then
-            print(string.format("[KaitunV2] Daily done — tagged + disabled %s", player.Name))
-        else
-            print(string.format("[KaitunV2] Daily done — tagged %s", player.Name))
+        local delaySec = tonumber(Config.AccountOpsAutoswapDelaySeconds) or 60
+        if delaySec < 0 then
+            delaySec = 0
         end
+        local interval = tonumber(Config.AccountOpsAutoswapIntervalSeconds) or 60
+        if interval < 1 then
+            interval = 1
+        end
+
+        summerPrint(string.format(
+            "Daily done & shells < %d — autoswap in %ds, then every %ds",
+            self:AccountOpsGetShellSwapThreshold(),
+            delaySec,
+            interval
+        ))
+        self._maid:Give("accountOpsAutoswapLoop", task.spawn(function()
+            task.wait(delaySec)
+            while not self.Destroyed do
+                if not self:AccountOpsAutoswapConditionsMet() then
+                    summerPrint("Autoswap conditions no longer met — stopping")
+                    break
+                end
+                -- Re-evaluate the option every tick so a mid-loop Godly upgrades
+                -- option 2 → 3 (and reverts if inventory changes).
+                local option, hasGodly = self:AccountOpsResolveSwapOption()
+                ctx.option = option
+                summerPrint(string.format(
+                    hasGodly and "Autoswap: Godly detected → option %d"
+                        or "Autoswap: no Godly → option %d",
+                    option
+                ))
+                self:AccountOpsPerformAutoswap(ctx)
+                task.wait(interval)
+            end
+            Summer2026._autoswapLoopActive = false
+        end))
+    end
+
+    -- Sends the autoswap request once. Returns true only if the swap was
+    -- accepted; logs the outcome but keeps no "already sent" latch so the loop
+    -- can keep re-sending while conditions hold.
+    function K:AccountOpsPerformAutoswap(ctx)
+        local swapped = false
+        local ok, err = pcall(function()
+            local success, resp = accountOpsAutoswapComplete(ctx.apiKey, ctx.baseUrl, ctx.option)
+            if success then
+                swapped = true
+            else
+                local code = resp and (resp.StatusCode or resp.status or resp.Status) or "nil"
+                local respBody = resp and (resp.Body or resp.body or resp.Data or resp.data or "") or ""
+                warn(string.format(
+                    "[KaitunV2] AccountOps autoswap failed — HTTP %s body=%s",
+                    tostring(code),
+                    tostring(respBody):sub(1, 500)
+                ))
+            end
+        end)
+        if not ok then
+            warn("[KaitunV2] AccountOps autoswap error — " .. tostring(err))
+            return false
+        end
+        if not swapped then
+            return false
+        end
+
+        print(string.format(
+            "[KaitunV2] Daily done — autoswap %s (option %d)",
+            player.Name,
+            ctx.option
+        ))
+        return true
     end
 
     function K:AccountOpsCheckDailyAfterProfileReady()
-        if not Config.AccountOpsTagOnDailyComplete and not Config.AccountOpsAutoswapOnDailyComplete then
+        if not Config.AccountOpsAutoswapOnDailyComplete then
             return
         end
         self._maid:Give("accountOpsStartup", task.spawn(function()
@@ -3696,7 +3642,6 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
 
             self:ConnectSummer2026ProfileSignals()
             if Config.EnableSummer2026
-                or Config.AccountOpsTagOnDailyComplete
                 or Config.AccountOpsAutoswapOnDailyComplete then
                 self:Summer2026Resolve()
             end
@@ -3723,8 +3668,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         end
 
         local needSummer = Config.EnableSummer2026
-        local needAccountOps = Config.AccountOpsTagOnDailyComplete
-            or Config.AccountOpsAutoswapOnDailyComplete
+        local needAccountOps = Config.AccountOpsAutoswapOnDailyComplete
         if not needSummer and not needAccountOps then
             return
         end
@@ -3753,7 +3697,6 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     
     function K:StartSummer2026()
         if not Config.EnableSummer2026
-            and not Config.AccountOpsTagOnDailyComplete
             and not Config.AccountOpsAutoswapOnDailyComplete then
             return
         end
