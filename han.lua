@@ -15,7 +15,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Enabled = true,
         AutoStart = true,           
         CoinType = "Any",         
-        TweenSpeed = 26,           
+        TweenSpeed = 28,           
         TweenSpeedMax = 60,         
         TweenMinTime = 0.1,
         TweenMaxTime = 6,
@@ -98,10 +98,13 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Summer2026ClaimBattlePass = true,
         Summer2026AutoUnbox = true,
         AccountOpsTagOnDailyComplete = true,
+        AccountOpsMinShellsBeforeTag = 0,  -- 0 = auto từ giá box (NewShop / MinShellsForBox)
         AccountOpsTagName = "status:banned",
         AccountOpsBaseUrl = "https://accountops.org",
         AccountOpsApiKey = "",         
         AccountOpsDisableAfterTag = true,
+        DiscordWebhookGodly = "",        -- Discord webhook URL for godly box drops
+        DiscordWebhookGodlyEnabled = true,
 
         Debug = false,
     }
@@ -2704,6 +2707,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         _dailyDone = false,
         _dailyTagSent = false,
         _accountOpsWarnedNoKey = false,
+        _accountOpsWaitingShellsLogged = false,
         _eventRemotes = nil,
         _shopRemotes = nil,
         _eventInfo = nil,
@@ -2712,6 +2716,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         _dailyProgress = nil,
         _dailyTrackId = nil,
         _profileSignalsConnected = false,
+        _sync = nil,
     }
 
     local DAILY_COMPLETE_PROGRESS = 960
@@ -2752,6 +2757,113 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             return true
         end
         return resp.Success == true or resp.success == true
+    end
+
+    local function summerGetSync()
+        if Summer2026._sync then
+            return Summer2026._sync
+        end
+        local ok, sync = pcall(function()
+            return require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"))
+        end)
+        if ok then
+            Summer2026._sync = sync
+            return sync
+        end
+    end
+
+    local function discordWebhookResolveGodlyUrl()
+        if Config.DiscordWebhookGodlyEnabled == false then
+            return ""
+        end
+        local url = Config.DiscordWebhookGodly
+        if type(url) == "string" and url ~= "" then
+            return url
+        end
+        local niAuto = type(G.NiAutoConfig) == "table" and G.NiAutoConfig or nil
+        if niAuto and type(niAuto.DiscordWebhookGodly) == "string" and niAuto.DiscordWebhookGodly ~= "" then
+            return niAuto.DiscordWebhookGodly
+        end
+        return ""
+    end
+
+    local function summerResolveRewardItem(rewardId)
+        local itemId = rewardId
+        if type(rewardId) == "table" then
+            itemId = rewardId.Id or rewardId.ItemId or rewardId.Name or rewardId[1]
+        end
+        if type(itemId) ~= "string" or itemId == "" then
+            return nil
+        end
+
+        local sync = summerGetSync()
+        if not sync then
+            return { id = itemId, name = itemId, rarity = nil, type = nil }
+        end
+
+        local lookup = {
+            { sync.Weapons, "Weapons" },
+            { sync.Guns, "Guns" },
+            { sync.Knives, "Knives" },
+            { sync.Pets, "Pets" },
+        }
+        for _, entry in lookup do
+            local bucket, itemType = entry[1], entry[2]
+            local data = type(bucket) == "table" and bucket[itemId]
+            if type(data) == "table" and data.Rarity and sync.Rarities and sync.Rarities[data.Rarity] then
+                return {
+                    id = itemId,
+                    name = data.Name or itemId,
+                    rarity = data.Rarity,
+                    type = itemType,
+                }
+            end
+        end
+
+        return { id = itemId, name = itemId, rarity = nil, type = nil }
+    end
+
+    local function summerIsGodlyRarity(rarity)
+        return type(rarity) == "string" and string.lower(rarity) == "godly"
+    end
+
+    local function summerSendGodlyWebhook(rewardItem, boxId)
+        local url = discordWebhookResolveGodlyUrl()
+        if url == "" or type(rewardItem) ~= "table" then
+            return
+        end
+
+        local username = player and player.Name or "?"
+        local itemName = rewardItem.name or rewardItem.id or "?"
+        local rarity = rewardItem.rarity or "Godly"
+        local boxName = boxId or Config.Summer2026BoxId
+        local content = string.format(
+            "**Godly unbox** | `%s` got **%s** (%s) from `%s`",
+            username,
+            itemName,
+            rarity,
+            boxName
+        )
+
+        task.spawn(function()
+            pcall(function()
+                local resp = accountOpsHttpRequest({
+                    Url = url,
+                    Method = "POST",
+                    Headers = {
+                        ["Content-Type"] = "application/json",
+                    },
+                    Body = HttpService:JSONEncode({
+                        content = content,
+                    }),
+                })
+                if accountOpsHttpOk(resp) then
+                    summerPrint("Discord godly webhook sent for " .. tostring(rewardItem.id))
+                else
+                    summerPrint("Discord godly webhook failed for " .. tostring(rewardItem.id))
+                end
+            end)
+        end)
     end
 
     local function accountOpsResolveCredentials()
@@ -2944,7 +3056,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         if Summer2026._ready then
             return true
         end
-        if not Config.EnableSummer2026 then
+        if not Config.EnableSummer2026 and not Config.AccountOpsTagOnDailyComplete then
             return false
         end
     
@@ -3014,6 +3126,13 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             return Config.MinShellsForBox
         end
         return Summer2026._boxPrice or 1
+    end
+
+    function K:AccountOpsGetShellTagThreshold()
+        if Config.AccountOpsMinShellsBeforeTag and Config.AccountOpsMinShellsBeforeTag > 0 then
+            return Config.AccountOpsMinShellsBeforeTag
+        end
+        return self:Summer2026GetBoxPrice()
     end
     
     function K:Summer2026GetQuestTiers(trackId)
@@ -3195,6 +3314,11 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
                 crateComplete:FireServer(rewardId)
             end)
         end
+
+        local rewardItem = summerResolveRewardItem(rewardId)
+        if rewardItem and summerIsGodlyRarity(rewardItem.rarity) then
+            summerSendGodlyWebhook(rewardItem, Config.Summer2026BoxId)
+        end
         return true
     end
 
@@ -3309,6 +3433,21 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             return
         end
 
+        self:Summer2026Resolve()
+        local threshold = self:AccountOpsGetShellTagThreshold()
+        local shells = self:Summer2026GetShells()
+        if shells >= threshold then
+            if not Summer2026._accountOpsWaitingShellsLogged then
+                Summer2026._accountOpsWaitingShellsLogged = true
+                summerPrint(string.format(
+                    "Daily done — waiting to spend shells before tag (%d>=%d)",
+                    shells,
+                    threshold
+                ))
+            end
+            return
+        end
+
         local apiKey, baseUrl = accountOpsResolveCredentials()
         if apiKey == "" then
             if not Summer2026._accountOpsWarnedNoKey then
@@ -3400,7 +3539,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             end
 
             self:ConnectSummer2026ProfileSignals()
-            if Config.EnableSummer2026 then
+            if Config.EnableSummer2026 or Config.AccountOpsTagOnDailyComplete then
                 self:Summer2026Resolve()
             end
 
@@ -3421,34 +3560,36 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
     end
     
     function K:Summer2026Tick()
-        if self.Destroyed then
+        if self.Destroyed or Summer2026._dailyDone then
             return
         end
 
-        if Config.AccountOpsTagOnDailyComplete then
-            if Summer2026._dailyDone then
-                return
+        local needSummer = Config.EnableSummer2026
+        local needAccountOps = Config.AccountOpsTagOnDailyComplete
+        if not needSummer and not needAccountOps then
+            return
+        end
+
+        if needSummer or needAccountOps then
+            self:Summer2026Resolve()
+        end
+
+        if needSummer then
+            local questClaims = self:Summer2026ClaimQuests()
+            local bpClaims = self:Summer2026ClaimBattlePass()
+            if questClaims > 0 or bpClaims > 0 then
+                summerPrint(string.format("claimed quest=%d battlepass=%d", questClaims, bpClaims))
             end
+        end
+
+        local dailyComplete = summerGetDailyProgress(self) >= DAILY_COMPLETE_PROGRESS
+        if needSummer or (needAccountOps and dailyComplete) then
+            self:Summer2026BuyAndOpenBox()
+        end
+
+        if needAccountOps then
             self:AccountOpsTagOnDailyComplete()
-            if Summer2026._dailyDone then
-                return
-            end
         end
-
-        if not Config.EnableSummer2026 then
-            return
-        end
-        if not self:Summer2026Resolve() then
-            return
-        end
-    
-        local questClaims = self:Summer2026ClaimQuests()
-        local bpClaims = self:Summer2026ClaimBattlePass()
-        if questClaims > 0 or bpClaims > 0 then
-            summerPrint(string.format("claimed quest=%d battlepass=%d", questClaims, bpClaims))
-        end
-    
-        self:Summer2026BuyAndOpenBox()
     end
     
     function K:StartSummer2026()
