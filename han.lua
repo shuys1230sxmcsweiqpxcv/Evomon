@@ -15,7 +15,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         Enabled = true,
         AutoStart = true,           
         CoinType = "Any",         
-        TweenSpeed = 28,           
+        TweenSpeed = 26,           
         TweenSpeedMax = 60,         
         TweenMinTime = 0.1,
         TweenMaxTime = 6,
@@ -103,6 +103,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         AccountOpsBaseUrl = "https://accountops.org",
         AccountOpsApiKey = "",         
         AccountOpsDisableAfterTag = true,
+        AccountOpsTagDelaySeconds = 60,    -- giây chờ sau khi shells < ngưỡng trước tag+disable
         DiscordWebhookGodly = "",        -- Discord webhook URL for godly box drops
         DiscordWebhookGodlyEnabled = true,
 
@@ -2708,6 +2709,8 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         _dailyTagSent = false,
         _accountOpsWarnedNoKey = false,
         _accountOpsWaitingShellsLogged = false,
+        _shellsBelowThresholdAt = nil,
+        _accountOpsTagDelayLogged = nil,
         _eventRemotes = nil,
         _shopRemotes = nil,
         _eventInfo = nil,
@@ -2787,10 +2790,24 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         return ""
     end
 
+    local function summerItemIsChroma(data, itemId, rewardTable)
+        if type(rewardTable) == "table" and rewardTable.Chroma == true then
+            return true
+        end
+        if type(data) == "table" and data.Chroma == true then
+            return true
+        end
+        if type(itemId) == "string" and itemId:sub(-6) == "Chroma" then
+            return true
+        end
+        return false
+    end
+
     local function summerResolveRewardItem(rewardId)
+        local rewardTable = type(rewardId) == "table" and rewardId or nil
         local itemId = rewardId
-        if type(rewardId) == "table" then
-            itemId = rewardId.Id or rewardId.ItemId or rewardId.Name or rewardId[1]
+        if rewardTable then
+            itemId = rewardTable.Id or rewardTable.ItemId or rewardTable.Name or rewardTable[1]
         end
         if type(itemId) ~= "string" or itemId == "" then
             return nil
@@ -2798,7 +2815,13 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
 
         local sync = summerGetSync()
         if not sync then
-            return { id = itemId, name = itemId, rarity = nil, type = nil }
+            return {
+                id = itemId,
+                name = itemId,
+                rarity = nil,
+                type = nil,
+                chroma = summerItemIsChroma(nil, itemId, rewardTable),
+            }
         end
 
         local lookup = {
@@ -2806,6 +2829,7 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             { sync.Guns, "Guns" },
             { sync.Knives, "Knives" },
             { sync.Pets, "Pets" },
+            { sync.Item, "Item" },
         }
         for _, entry in lookup do
             local bucket, itemType = entry[1], entry[2]
@@ -2813,14 +2837,21 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
             if type(data) == "table" and data.Rarity and sync.Rarities and sync.Rarities[data.Rarity] then
                 return {
                     id = itemId,
-                    name = data.Name or itemId,
+                    name = data.Name or data.ItemName or itemId,
                     rarity = data.Rarity,
                     type = itemType,
+                    chroma = summerItemIsChroma(data, itemId, rewardTable),
                 }
             end
         end
 
-        return { id = itemId, name = itemId, rarity = nil, type = nil }
+        return {
+            id = itemId,
+            name = itemId,
+            rarity = nil,
+            type = nil,
+            chroma = summerItemIsChroma(nil, itemId, rewardTable),
+        }
     end
 
     local function summerIsGodlyRarity(rarity)
@@ -2837,12 +2868,14 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         local itemName = rewardItem.name or rewardItem.id or "?"
         local rarity = rewardItem.rarity or "Godly"
         local boxName = boxId or Config.Summer2026BoxId
+        local chromaSuffix = rewardItem.chroma and " | Chroma: Yes" or ""
         local content = string.format(
-            "**Godly unbox** | `%s` got **%s** (%s) from `%s`",
+            "**Godly unbox** | `%s` got **%s** (%s) from `%s`%s",
             username,
             itemName,
             rarity,
-            boxName
+            boxName,
+            chromaSuffix
         )
 
         task.spawn(function()
@@ -3437,6 +3470,8 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
         local threshold = self:AccountOpsGetShellTagThreshold()
         local shells = self:Summer2026GetShells()
         if shells >= threshold then
+            Summer2026._shellsBelowThresholdAt = nil
+            Summer2026._accountOpsTagDelayLogged = nil
             if not Summer2026._accountOpsWaitingShellsLogged then
                 Summer2026._accountOpsWaitingShellsLogged = true
                 summerPrint(string.format(
@@ -3444,6 +3479,26 @@ local G = (type(getgenv) == "function" and getgenv()) or _G
                     shells,
                     threshold
                 ))
+            end
+            return
+        end
+
+        Summer2026._accountOpsWaitingShellsLogged = false
+        if not Summer2026._shellsBelowThresholdAt then
+            Summer2026._shellsBelowThresholdAt = os.clock()
+            Summer2026._accountOpsTagDelayLogged = nil
+        end
+
+        local delaySec = tonumber(Config.AccountOpsTagDelaySeconds) or 60
+        if delaySec < 0 then
+            delaySec = 0
+        end
+        local elapsed = os.clock() - Summer2026._shellsBelowThresholdAt
+        if elapsed < delaySec then
+            local remaining = math.ceil(delaySec - elapsed)
+            if Summer2026._accountOpsTagDelayLogged ~= remaining then
+                Summer2026._accountOpsTagDelayLogged = remaining
+                summerPrint(string.format("Daily done — tag+disable in %ds", remaining))
             end
             return
         end
